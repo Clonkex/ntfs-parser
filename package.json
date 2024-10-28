@@ -1,0 +1,17 @@
+{
+    "type": "module",
+    "scripts": {
+        "build": "eslint src --ext .ts && npx tsc",
+        "start": "npm run build && node --enable-source-maps dist/main.js"
+    },
+    "dependencies": {
+    },
+    "devDependencies": {
+        "@tsconfig/node20": "~20.1.2",
+        "@types/node": "~20.8.10",
+		"@typescript-eslint/eslint-plugin": "~7.0.2",
+		"@typescript-eslint/parser": "~7.0.2",
+		"eslint": "~8.56.0",
+		"typescript": "~5.3.3"
+    }
+}
