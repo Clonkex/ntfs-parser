@@ -1,4 +1,4 @@
-import fs from 'fs/promises';
+import fs, { type FileHandle } from 'fs/promises';
 
 enum AttributeType {
     STANDARD_INFORMATION  = 0x10,
@@ -86,6 +86,7 @@ interface BaseAttributeHeader {
     nameOffset: number;
     flags: number;
     attributeId: number;
+    name: string;
 }
 
 interface ResidentAttributeHeader extends BaseAttributeHeader {
@@ -113,7 +114,7 @@ type AttributeHeader = ResidentAttributeHeader | NonResidentAttributeHeader;
 
 interface Attribute {
     header: AttributeHeader;
-    contents?: Buffer;
+    contents: Buffer;
 }
 
 interface FileRecord {
@@ -123,9 +124,9 @@ interface FileRecord {
 
 const PARTITION_BOOT_SECTOR_SIZE = 512;
 const FILE_RECORD_SIZE = 1024;
-const BASE_ATTRIBUTE_HEADER_MIN_LENGTH = 16;
-const RESIDENT_ATTRIBUTE_HEADER_MIN_LENGTH = BASE_ATTRIBUTE_HEADER_MIN_LENGTH + 8;
-const NON_RESIDENT_ATTRIBUTE_HEADER_MIN_LENGTH = BASE_ATTRIBUTE_HEADER_MIN_LENGTH + 48;
+// const BASE_ATTRIBUTE_HEADER_MIN_LENGTH = 16;
+// const RESIDENT_ATTRIBUTE_HEADER_MIN_LENGTH = BASE_ATTRIBUTE_HEADER_MIN_LENGTH + 8;
+// const NON_RESIDENT_ATTRIBUTE_HEADER_MIN_LENGTH = BASE_ATTRIBUTE_HEADER_MIN_LENGTH + 48;
 
 await main();
 
@@ -152,6 +153,10 @@ async function main(): Promise<void> {
     }
     
     //dataAttribute.header.dataRunsOffset
+    //const data = readFileData(file, mftFileRecord);
+    console.log('about to read filename');
+    const filename = readFileName(file, mftFileRecord);
+    console.log(filename);
 }
 
 function parsePartitionBootSector(buffer: Buffer): PartitionBootSector {
@@ -213,7 +218,12 @@ function parseFileRecord(buffer: Buffer): FileRecord {
     record.attributes = [];
     console.log(offset);
     console.log(record.header.firstAttributeOffset);
-    offset = record.header.firstAttributeOffset;
+    parseFileRecordAttributes(record, buffer);
+    return record;
+}
+
+function parseFileRecordAttributes(fileRecord: FileRecord, buffer: Buffer): void {
+    let offset = fileRecord.header.firstAttributeOffset;
     while (true) {
         const attributeStartOffset = offset;
         console.log(offset);
@@ -226,6 +236,9 @@ function parseFileRecord(buffer: Buffer): FileRecord {
         baseHeader.nameOffset    = buffer.readUint16LE(offset);                 offset += 2;
         baseHeader.flags         = buffer.readUint16LE(offset);                 offset += 2;
         baseHeader.attributeId   = buffer.readUint16LE(offset);                 offset += 2;
+        if (baseHeader.nameLength > 0) {
+            baseHeader.name = buffer.toString('utf8', attributeStartOffset + baseHeader.nameOffset, attributeStartOffset + baseHeader.nameOffset + baseHeader.nameLength);
+        }
         if (baseHeader.nonResident) {
             attribute.header = baseHeader as NonResidentAttributeHeader;
             attribute.header.firstCluster       = buffer.readBigInt64LE(offset);  offset += 8;
@@ -237,38 +250,60 @@ function parseFileRecord(buffer: Buffer): FileRecord {
             attribute.header.attributeSize      = buffer.readBigUint64LE(offset); offset += 8;
             attribute.header.streamDataSize     = buffer.readBigUint64LE(offset); offset += 8;
             attribute.header.dataRuns = [];
-            // offset = attribute.header.dataRunsOffset;
-            // while (offset < attribute.header.length) {
-            //     const subBuffer = buffer.subarray(offset, offset + 17);
-            //     if (subBuffer.readUint8(0) === 0) { // jank way of checking for an empty data run which apparently can indicate no more data runs (is this always the case?)
-            //         break;
-            //     }
-            //     const dataRun: DataRun = {} as DataRun;
-            //     const fullByte = buffer.readUint8(offset);                                     offset += 1;
-            //     dataRun.lengthFieldLength = fullByte & 0x0F;
-            //     dataRun.offsetFieldLength = (fullByte & 0xF0) >> 4;
-            //     dataRun.length = BigInt(buffer.readUintLE(offset, dataRun.lengthFieldLength)); offset += dataRun.lengthFieldLength;
-            //     dataRun.offset = BigInt(buffer.readUintLE(offset, dataRun.offsetFieldLength)); offset += dataRun.offsetFieldLength;
-            //     attribute.header.dataRuns.push(dataRun);
-            //     offset += 1 + dataRun.lengthFieldLength + dataRun.offsetFieldLength;
-            // }
+            parseAttributeDataRuns(attribute, buffer, attributeStartOffset);
+            attribute.contents = Buffer.alloc(0);
         } else {
             attribute.header = baseHeader as ResidentAttributeHeader;
             attribute.header.valueLength = buffer.readUint32LE(offset);                 offset += 4;
             attribute.header.valueOffset = buffer.readUint16LE(offset);                 offset += 2;
             attribute.header.indexed     = buffer.readUint8(offset) > 0 ? true : false; offset += 1;
             attribute.header.unused      = buffer.readUint8(offset);                    offset += 1;
+            offset = attributeStartOffset + attribute.header.valueOffset;
+            attribute.contents = buffer.subarray(offset, offset + attribute.header.length);
         }
-        
-        record.attributes.push(attribute);
+        fileRecord.attributes.push(attribute);
         if (attribute.header.attributeType === AttributeType.END) {
             break;
         }
         offset = attributeStartOffset + attribute.header.length;
     }
-    return record;
 }
 
-function parseFileRecordAttribute(buffer: Buffer) {
-    
+function parseAttributeDataRuns(attribute: Attribute, buffer: Buffer, attributeStartOffset: number): void {
+    if (!attribute.header.nonResident) {
+        throw new Error('Cannot parse attribute data runs for resident attribute');
+    }
+    let offset = attributeStartOffset + attribute.header.dataRunsOffset;
+    while (offset < attributeStartOffset + attribute.header.length) {
+        const dataRun: DataRun = {} as DataRun;
+        const fullByte = buffer.readUint8(offset);                                     offset += 1;
+        console.log('fullByte: ', fullByte);
+        dataRun.lengthFieldLength = fullByte & 0x0F;
+        dataRun.offsetFieldLength = (fullByte & 0xF0) >> 4;
+        dataRun.length = BigInt(buffer.readUintLE(offset, dataRun.lengthFieldLength)); offset += dataRun.lengthFieldLength;
+        dataRun.offset = BigInt(buffer.readUintLE(offset, dataRun.offsetFieldLength)); offset += dataRun.offsetFieldLength;
+        attribute.header.dataRuns.push(dataRun);
+        offset += 1 + dataRun.lengthFieldLength + dataRun.offsetFieldLength;
+    }
 }
+
+function readFileName(file: FileHandle, fileRecord: FileRecord): string {
+    const filenameAttribute = fileRecord.attributes.find(a => a.header.attributeType === AttributeType.FILE_NAME);
+    if (filenameAttribute === undefined) {
+        throw new Error('File does not contain filename attribute');
+    }
+    if (filenameAttribute.header.nonResident) {
+        for (const dataRun of filenameAttribute.header.dataRuns) {
+            console.log(dataRun);
+        }
+        return '';
+    } else {
+        console.log(filenameAttribute.contents);
+        console.log(filenameAttribute.contents.toString('ascii'));
+        return 'lel resident name';
+    }
+}
+
+//function readFileData(file: FileHandle, fileRecord: FileRecord): Buffer {
+//    if (fileRecord.header.)
+//}
