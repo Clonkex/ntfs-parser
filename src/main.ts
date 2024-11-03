@@ -1,5 +1,16 @@
 import fs, { type FileHandle } from 'fs/promises';
 
+const PARTITION_BOOT_SECTOR_LENGTH = 512;
+const BPB_LENGTH = 25;
+const EXTENDED_BPB_LENGTH = 48;
+const PARTITION_BOOTSTRAP_CODE_LENGTH = 426;
+const FILE_RECORD_SIZE = 1024;
+const FILE_RECORD_HEADER_SIZE = 48;
+// const BASE_ATTRIBUTE_HEADER_MIN_LENGTH = 16;
+// const RESIDENT_ATTRIBUTE_HEADER_MIN_LENGTH = BASE_ATTRIBUTE_HEADER_MIN_LENGTH + 8;
+const DATA_RUN_MAX_LENGTH = 17;
+// const NON_RESIDENT_ATTRIBUTE_HEADER_MIN_LENGTH = BASE_ATTRIBUTE_HEADER_MIN_LENGTH + 48;
+
 enum AttributeType {
     STANDARD_INFORMATION  = 0x10,
     ATTRIBUTE_LIST        = 0x20,
@@ -19,129 +30,303 @@ enum AttributeType {
     END                   = 0xFFFFFFFF,
 }
 
-interface DataRun {
-    lengthFieldLength: number; // The number of bytes used to make up `length`
-    offsetFieldLength: number; // The number of bytes used to make up `offset`
-    length: bigint;            // A variable-length field from 1 to 8 bytes
-    offset: bigint;            // A variable-length field from 1 to 8 bytes
+class BPB {
+    public bytesPerSector = 0;    // 2 bytes
+    public sectorsPerCluster = 0; // 1 byte
+    public reservedSectors = 0;   // 2 bytes
+    public alwaysZero1 = 0;       // 3 bytes
+    public unused1 = 0;           // 2 bytes
+    public mediaDescripter = 0;   // 1 byte
+    public alwaysZero2 = 0;       // 2 bytes
+    public sectorsPerTrack = 0;   // 2 bytes
+    public numberOfHeads = 0;     // 2 bytes
+    public hiddenSectors = 0;     // 4 bytes
+    public unused2 = 0;           // 4 bytes
+    
+    public parse(buffer: Buffer): number {
+        if (buffer.byteLength < BPB_LENGTH) {
+            throw new Error(`Buffer is too short for BPB (${buffer.byteLength} < ${{BPB_LENGTH}})`);
+        }
+        let offset = 0;
+        this.bytesPerSector    = buffer.readUint16LE(offset);  offset += 2;
+        this.sectorsPerCluster = buffer.readUint8(offset);     offset += 1;
+        this.reservedSectors   = buffer.readUint16LE(offset);  offset += 2;
+        this.alwaysZero1       = buffer.readUintLE(offset, 3); offset += 3;
+        this.unused1           = buffer.readUint16LE(offset);  offset += 2;
+        this.mediaDescripter   = buffer.readUint8(offset);     offset += 1;
+        this.alwaysZero2       = buffer.readUint16LE(offset);  offset += 2;
+        this.sectorsPerTrack   = buffer.readUint16LE(offset);  offset += 2;
+        this.numberOfHeads     = buffer.readUint16LE(offset);  offset += 2;
+        this.hiddenSectors     = buffer.readUint32LE(offset);  offset += 4;
+        this.unused2           = buffer.readUint32LE(offset);  offset += 4;
+        return offset;
+    }
 }
 
-interface BPB {
-    bytesPerSector: number;    // 2 bytes
-    sectorsPerCluster: number; // 1 byte
-    reservedSectors: number;   // 2 bytes
-    alwaysZero1: number;       // 3 bytes
-    unused1: number;           // 2 bytes
-    mediaDescripter: number;   // 1 byte
-    alwaysZero2: number;       // 2 bytes
-    sectorsPerTrack: number;   // 2 bytes
-    numberOfHeads: number;     // 2 bytes
-    hiddenSectors: number;     // 4 bytes
-    unused2: number;           // 4 bytes
+class ExtendedBPB {
+    public unused1 = 0;                        // 4 bytes
+    public totalSectors = 0n;                  // 8 bytes
+    public mftLogicalClusterNumber = 0n;       // 8 bytes
+    public mftMirrorLogicalClusterNumber = 0n; // 8 bytes
+    public clustersPerFileRecordSegment = 0;   // 4 bytes
+    public clustersPerIndexBuffer = 0;         // 1 byte
+    public unused2 = 0;                        // 3 bytes
+    public volumeSerialNumber = 0n;            // 8 bytes
+    public checksum = 0;                       // 4 bytes
+    
+    public parse(buffer: Buffer): number {
+        if (buffer.byteLength < EXTENDED_BPB_LENGTH) {
+            throw new Error(`Buffer is too short for extended BPB (${buffer.byteLength} < ${{EXTENDED_BPB_LENGTH}})`);
+        }
+        let offset = 0;
+        this.unused1                       = buffer.readUInt32LE(offset);    offset += 4;
+        this.totalSectors                  = buffer.readBigUInt64LE(offset); offset += 8;
+        this.mftLogicalClusterNumber       = buffer.readBigUint64LE(offset); offset += 8;
+        this.mftMirrorLogicalClusterNumber = buffer.readBigUint64LE(offset); offset += 8;
+        this.clustersPerFileRecordSegment  = buffer.readUInt32LE(offset);    offset += 4;
+        this.clustersPerIndexBuffer        = buffer.readUint8(offset);       offset += 1;
+        this.unused2                       = buffer.readUintLE(offset, 3);   offset += 3;
+        this.volumeSerialNumber            = buffer.readBigUint64LE(offset); offset += 8;
+        this.checksum                      = buffer.readUInt32LE(offset);    offset += 4;
+        return offset;
+    }
 }
 
-interface ExtendedBPB {
-    unused1: number;                       // 4 bytes
-    totalSectors: bigint;                  // 8 bytes
-    mftLogicalClusterNumber: bigint;       // 8 bytes
-    mftMirrorLogicalClusterNumber: bigint; // 8 bytes
-    clustersPerFileRecordSegment: number;  // 4 bytes
-    clustersPerIndexBuffer: number;        // 1 byte
-    unused2: number;                       // 3 bytes
-    volumeSerialNumber: bigint;            // 8 bytes
-    checksum: number;                      // 4 bytes
+class PartitionBootSector {
+    public jumpInstruction = 0;             // 3 bytes
+    public oemId = '';                      // 8 bytes
+    public bpb = new BPB();                 // 25 bytes
+    public extendedBpb = new ExtendedBPB(); // 48 bytes
+    public bootstrapCode = Buffer.alloc(0); // 426 bytes
+    public endOfSectorMarker = 0;           // 2 bytes
+    
+    public parse(buffer: Buffer): number {
+        if (buffer.byteLength < PARTITION_BOOT_SECTOR_LENGTH) {
+            throw new Error(`Buffer is too short for partition boot sector (${buffer.byteLength} < ${{PARTITION_BOOT_SECTOR_LENGTH}})`);
+        }
+        let offset = 0;
+        this.jumpInstruction   = buffer.readUintLE(offset, 3);                                      offset += 3;
+        this.oemId             = buffer.toString('ascii', offset, offset + 8);                      offset += 8;
+        offset += this.bpb.parse(buffer.subarray(offset, offset + BPB_LENGTH));
+        offset += this.extendedBpb.parse(buffer.subarray(offset, offset + EXTENDED_BPB_LENGTH));
+        this.bootstrapCode     = buffer.subarray(offset, offset + PARTITION_BOOTSTRAP_CODE_LENGTH); offset += PARTITION_BOOTSTRAP_CODE_LENGTH;
+        this.endOfSectorMarker = buffer.readUInt16LE(offset);                                       offset += 2;
+        return offset;
+    }
 }
 
-interface PartitionBootSector {
-    jumpInstruction: number;   // 3 bytes
-    oemId: string;             // 8 bytes
-    bpb: BPB;                  // 25 bytes
-    extendedBpb: ExtendedBPB;  // 48 bytes
-    bootstrapCode: Buffer;     // 426 bytes
-    endOfSectorMarker: number; // 2 bytes
+class FileRecordHeader {
+    public magic = '';               // 4 bytes, always FILE or BAAD
+    public updateSequenceOffset = 0; // 2 bytes
+    public updateSequenceSize = 0;   // 2 bytes
+    public logSequence = 0n;         // 8 bytes
+    public sequenceNumber = 0;       // 2 bytes
+    public hardLinkCount = 0;        // 2 bytes
+    public firstAttributeOffset = 0; // 2 bytes, number of bytes between the start of the header and the first attribute header
+    public flags = 0;                // 2 bytes
+    public usedSize = 0;             // 4 bytes
+    public allocatedSize = 0;        // 4 bytes
+    public fileReference = 0n;       // 8 bytes
+    public nextAttributeId = 0;      // 2 bytes
+    public unused = 0;               // 2 bytes
+    public recordNumber = 0;         // 4 bytes
+    
+    public parse(buffer: Buffer): number {
+        if (buffer.byteLength < FILE_RECORD_HEADER_SIZE) {
+            throw new Error(`Buffer is too short for file record header (${buffer.byteLength} < ${{FILE_RECORD_HEADER_SIZE}})`);
+        }
+        let offset = 0;
+        this.magic                = buffer.toString('ascii', 0, 4); offset += 4;
+        this.updateSequenceOffset = buffer.readUint16LE(offset);    offset += 2;
+        this.updateSequenceSize   = buffer.readUint16LE(offset);    offset += 2;
+        this.logSequence          = buffer.readBigUint64LE(offset); offset += 8;
+        this.sequenceNumber       = buffer.readUint16LE(offset);    offset += 2;
+        this.hardLinkCount        = buffer.readUint16LE(offset);    offset += 2;
+        this.firstAttributeOffset = buffer.readUint16LE(offset);    offset += 2;
+        this.flags                = buffer.readUint16LE(offset);    offset += 2;
+        this.usedSize             = buffer.readUInt32LE(offset);    offset += 4;
+        this.allocatedSize        = buffer.readUInt32LE(offset);    offset += 4;
+        this.fileReference        = buffer.readBigUInt64LE(offset); offset += 8;
+        this.nextAttributeId      = buffer.readUInt16LE(offset);    offset += 2;
+        this.unused               = buffer.readUInt16LE(offset);    offset += 2;
+        this.recordNumber         = buffer.readUint32LE(offset);    offset += 4;
+        return offset;
+    }
 }
 
-interface FileRecordHeader {
-    magic: string;                // 4 bytes, always FILE or BAAD
-    updateSequenceOffset: number; // 2 bytes
-    updateSequenceSize: number;   // 2 bytes
-    logSequence: bigint;          // 8 bytes
-    sequenceNumber: number;       // 2 bytes
-    hardLinkCount: number;        // 2 bytes
-    firstAttributeOffset: number; // 2 bytes, number of bytes between the start of the header and the first attribute header
-    flags: number;                // 2 bytes
-    usedSize: number;             // 4 bytes
-    allocatedSize: number;        // 4 bytes
-    fileReference: bigint;        // 8 bytes
-    nextAttributeId: number;      // 2 bytes
-    unused: number;               // 2 bytes
-    recordNumber: number;         // 4 bytes
+class BaseAttributeHeader {
+    public attributeType = AttributeType.STANDARD_INFORMATION;
+    public length = 0;
+    public nonResident = false;
+    public nameLength = 0;
+    public nameOffset = 0;
+    public flags = 0;
+    public attributeId = 0;
+    public name = '';
+    
+    public parse(buffer: Buffer): number {
+        let offset = 0;
+        this.attributeType = buffer.readUInt32LE(offset);                 offset += 4;
+        this.length        = buffer.readUint32LE(offset);                 offset += 4;
+        this.nonResident   = buffer.readUint8(offset) > 0 ? true : false; offset += 1;
+        this.nameLength    = buffer.readUint8(offset);                    offset += 1;
+        this.nameOffset    = buffer.readUint16LE(offset);                 offset += 2;
+        this.flags         = buffer.readUint16LE(offset);                 offset += 2;
+        this.attributeId   = buffer.readUint16LE(offset);                 offset += 2;
+        if (this.nameLength > 0) {
+            this.name = buffer.toString('utf8', this.nameOffset, this.nameOffset + this.nameLength);
+        }
+        return offset;
+    }
+    
+    public static parseIsNonResident(buffer: Buffer): boolean {
+        return buffer.readUint8(8) > 0 ? true : false;
+    }
 }
 
-interface BaseAttributeHeader {
-    attributeType: AttributeType;
-    length: number;
-    nonResident: boolean;
-    nameLength: number;
-    nameOffset: number;
-    flags: number;
-    attributeId: number;
-    name: string;
+class ResidentAttributeHeader extends BaseAttributeHeader {
+    public nonResident = false as const;
+    public valueLength = 0;
+    public valueOffset = 0;
+    public indexed = false;
+    public unused = 0;
+    
+    public parse(buffer: Buffer): number {
+        let offset = 0;
+        offset += super.parse(buffer);
+        this.valueLength = buffer.readUint32LE(offset);                 offset += 4;
+        this.valueOffset = buffer.readUint16LE(offset);                 offset += 2;
+        this.indexed     = buffer.readUint8(offset) > 0 ? true : false; offset += 1;
+        this.unused      = buffer.readUint8(offset);                    offset += 1;
+        return offset;
+    }
 }
 
-interface ResidentAttributeHeader extends BaseAttributeHeader {
-    nonResident: false;
-    valueLength: number;
-    valueOffset: number;
-    indexed: boolean;
-    unused: number;
+class DataRun {
+    public lengthFieldLength = 0; // The number of bytes used to make up `length`
+    public offsetFieldLength = 0; // The number of bytes used to make up `offset`
+    public length = 0n;           // A variable-length field from 1 to 8 bytes
+    public offset = 0n;           // A variable-length field from 1 to 8 bytes
+    
+    public parse(buffer: Buffer): number {
+        if (buffer.byteLength < DATA_RUN_MAX_LENGTH) {
+            throw new Error(`Buffer is too short for data run (${buffer.byteLength} < ${{DATA_RUN_MAX_LENGTH}})`);
+        }
+        let offset = 0;
+        const fullByte = buffer.readUint8(offset);                                     offset += 1;
+        console.log('fullByte: ', fullByte);
+        this.lengthFieldLength = fullByte & 0x0F;
+        this.offsetFieldLength = (fullByte & 0xF0) >> 4;
+        if (fullByte === 0) {
+            return offset;
+        }
+        this.length = BigInt(buffer.readUintLE(offset, this.lengthFieldLength)); offset += this.lengthFieldLength;
+        this.offset = BigInt(buffer.readUintLE(offset, this.offsetFieldLength)); offset += this.offsetFieldLength;
+        return offset;
+    }
 }
 
-interface NonResidentAttributeHeader extends BaseAttributeHeader {
-    nonResident: true;
-    firstCluster: bigint;
-    lastCluster: bigint;
-    dataRunsOffset: number;
-    compressionUnit: number;
-    unused: number;
-    attributeAllocated: bigint;
-    attributeSize: bigint;
-    streamDataSize: bigint;
-    dataRuns: DataRun[];
+class NonResidentAttributeHeader extends BaseAttributeHeader {
+    public nonResident = true as const;
+    public firstCluster = 0n;
+    public lastCluster = 0n;
+    public dataRunsOffset = 0;
+    public compressionUnit = 0;
+    public unused = 0;
+    public attributeAllocated = 0n;
+    public attributeSize = 0n;
+    public streamDataSize = 0n;
+    public dataRuns: DataRun[] = [];
+    
+    public parse(buffer: Buffer): number {
+        let offset = 0;
+        offset += super.parse(buffer);
+        this.firstCluster       = buffer.readBigInt64LE(offset);  offset += 8;
+        this.lastCluster        = buffer.readBigInt64LE(offset);  offset += 8;
+        this.dataRunsOffset     = buffer.readUInt16LE(offset);    offset += 2;
+        this.compressionUnit    = buffer.readUInt16LE(offset);    offset += 2;
+        this.unused             = buffer.readUInt32LE(offset);    offset += 4;
+        this.attributeAllocated = buffer.readBigUint64LE(offset); offset += 8;
+        this.attributeSize      = buffer.readBigUint64LE(offset); offset += 8;
+        this.streamDataSize     = buffer.readBigUint64LE(offset); offset += 8;
+        
+        // Parse data runs
+        offset = this.dataRunsOffset;
+        while (offset < this.length) {
+            const dataRun = new DataRun();
+            offset += dataRun.parse(buffer.subarray(offset, offset + DATA_RUN_MAX_LENGTH));
+            if (dataRun.lengthFieldLength === 0) {
+                break;
+            }
+            this.dataRuns.push(dataRun);
+        }
+        return offset;
+    }
 }
 
 type AttributeHeader = ResidentAttributeHeader | NonResidentAttributeHeader;
 
-interface Attribute {
-    header: AttributeHeader;
-    contents: Buffer;
+class Attribute {
+    public header: AttributeHeader = new ResidentAttributeHeader();
+    public contents = Buffer.alloc(0);
+    
+    public parse(buffer: Buffer): void {
+        const nonResident = BaseAttributeHeader.parseIsNonResident(buffer);
+        if (nonResident) {
+            this.header = new NonResidentAttributeHeader();
+        }
+        this.header.parse(buffer);
+        if (this.header.nonResident) {
+            this.contents = Buffer.alloc(0);
+        } else {
+            this.contents = buffer.subarray(this.header.valueOffset, this.header.valueOffset + this.header.length);
+        }
+    }
 }
 
-interface FileRecord {
-    header: FileRecordHeader;
-    attributes: Attribute[];
+class FileRecord {
+    public header = new FileRecordHeader();
+    public attributes: Attribute[] = [];
+    
+    public parse(buffer: Buffer): number {
+        if (buffer.byteLength < FILE_RECORD_SIZE) {
+            throw new Error(`Buffer is too short for file record (${buffer.byteLength} < ${{FILE_RECORD_SIZE}})`);
+        }
+        let offset = 0;
+        offset += this.header.parse(buffer.subarray(offset, offset + FILE_RECORD_HEADER_SIZE));
+        console.log(offset);
+        console.log(this.header.firstAttributeOffset);
+        let attributeStartOffset = this.header.firstAttributeOffset;
+        while (true) {
+            console.log(attributeStartOffset);
+            const attribute = new Attribute();
+            attribute.parse(buffer.subarray(attributeStartOffset));
+            this.attributes.push(attribute);
+            if (attribute.header.attributeType === AttributeType.END) {
+                break;
+            }
+            attributeStartOffset += attribute.header.length;
+        }
+        return attributeStartOffset;
+    }
 }
-
-const PARTITION_BOOT_SECTOR_SIZE = 512;
-const FILE_RECORD_SIZE = 1024;
-// const BASE_ATTRIBUTE_HEADER_MIN_LENGTH = 16;
-// const RESIDENT_ATTRIBUTE_HEADER_MIN_LENGTH = BASE_ATTRIBUTE_HEADER_MIN_LENGTH + 8;
-// const NON_RESIDENT_ATTRIBUTE_HEADER_MIN_LENGTH = BASE_ATTRIBUTE_HEADER_MIN_LENGTH + 48;
 
 await main();
 
 async function main(): Promise<void> {
     const file = await fs.open('N:/jesslap/backup-nvme0n1p1.img');
     
-    const partitionBootSectorBuffer = Buffer.alloc(PARTITION_BOOT_SECTOR_SIZE);
-    await file.read(partitionBootSectorBuffer, 0, PARTITION_BOOT_SECTOR_SIZE, 0);
-    const bootSector = parsePartitionBootSector(partitionBootSectorBuffer);
+    const partitionBootSectorBuffer = Buffer.alloc(PARTITION_BOOT_SECTOR_LENGTH);
+    await file.read(partitionBootSectorBuffer, 0, PARTITION_BOOT_SECTOR_LENGTH, 0);
+    const bootSector = new PartitionBootSector();
+    bootSector.parse(partitionBootSectorBuffer);
     console.log(bootSector);
     
     const mftFileRecordBuffer = Buffer.alloc(FILE_RECORD_SIZE);
     const mftStartByte = bootSector.extendedBpb.mftLogicalClusterNumber * BigInt(bootSector.bpb.sectorsPerCluster) * BigInt(bootSector.bpb.bytesPerSector);
     await file.read(mftFileRecordBuffer, 0, FILE_RECORD_SIZE, Number(mftStartByte));
-    const mftFileRecord = parseFileRecord(mftFileRecordBuffer);
+    const mftFileRecord = new FileRecord();
+    mftFileRecord.parse(mftFileRecordBuffer);
     console.dir(mftFileRecord, {depth: null});
     
     const dataAttribute = mftFileRecord.attributes.find(a => a.header.attributeType === AttributeType.DATA);
@@ -152,139 +337,10 @@ async function main(): Promise<void> {
         throw new Error('Data attribute for MFT file is resident (this is unexpected)');
     }
     
-    //dataAttribute.header.dataRunsOffset
     //const data = readFileData(file, mftFileRecord);
     console.log('about to read filename');
     const filename = readFileName(file, mftFileRecord);
     console.log(filename);
-}
-
-function parsePartitionBootSector(buffer: Buffer): PartitionBootSector {
-    if (buffer.byteLength < PARTITION_BOOT_SECTOR_SIZE) {
-        throw new Error(`Buffer is too short for partition boot sector (${buffer.byteLength} < ${{PARTITION_BOOT_SECTOR_SIZE}})`);
-    }
-    let offset = 0;
-    const bootSector: PartitionBootSector = {} as PartitionBootSector;
-    bootSector.jumpInstruction = buffer.readUintLE(offset, 3);                 offset += 3;
-    bootSector.oemId           = buffer.toString('ascii', offset, offset + 8); offset += 8;
-    bootSector.bpb = {} as BPB;
-    bootSector.bpb.bytesPerSector    = buffer.readUint16LE(offset);  offset += 2;
-    bootSector.bpb.sectorsPerCluster = buffer.readUint8(offset);     offset += 1;
-    bootSector.bpb.reservedSectors   = buffer.readUint16LE(offset);  offset += 2;
-    bootSector.bpb.alwaysZero1       = buffer.readUintLE(offset, 3); offset += 3;
-    bootSector.bpb.unused1           = buffer.readUint16LE(offset);  offset += 2;
-    bootSector.bpb.mediaDescripter   = buffer.readUint8(offset);     offset += 1;
-    bootSector.bpb.alwaysZero2       = buffer.readUint16LE(offset);  offset += 2;
-    bootSector.bpb.sectorsPerTrack   = buffer.readUint16LE(offset);  offset += 2;
-    bootSector.bpb.numberOfHeads     = buffer.readUint16LE(offset);  offset += 2;
-    bootSector.bpb.hiddenSectors     = buffer.readUint32LE(offset);  offset += 4;
-    bootSector.bpb.unused2           = buffer.readUint32LE(offset);  offset += 4;
-    bootSector.extendedBpb = {} as ExtendedBPB;
-    bootSector.extendedBpb.unused1                       = buffer.readUInt32LE(offset);           offset += 4;
-    bootSector.extendedBpb.totalSectors                  = buffer.readBigUInt64LE(offset);        offset += 8;
-    bootSector.extendedBpb.mftLogicalClusterNumber       = buffer.readBigUint64LE(offset);        offset += 8;
-    bootSector.extendedBpb.mftMirrorLogicalClusterNumber = buffer.readBigUint64LE(offset);        offset += 8;
-    bootSector.extendedBpb.clustersPerFileRecordSegment  = buffer.readUInt32LE(offset);           offset += 4;
-    bootSector.extendedBpb.clustersPerIndexBuffer        = buffer.readUint8(offset);              offset += 1;
-    bootSector.extendedBpb.unused2                       = buffer.readUintLE(offset, 3);          offset += 3;
-    bootSector.extendedBpb.volumeSerialNumber            = buffer.readBigUint64LE(offset);        offset += 8;
-    bootSector.extendedBpb.checksum                      = buffer.readUInt32LE(offset);           offset += 4;
-    bootSector.bootstrapCode                             = buffer.subarray(offset, offset + 426); offset += 426;
-    bootSector.endOfSectorMarker                         = buffer.readUInt16LE(offset);           offset += 2;
-    return bootSector;
-}
-
-function parseFileRecord(buffer: Buffer): FileRecord {
-    if (buffer.byteLength < FILE_RECORD_SIZE) {
-        throw new Error(`Buffer is too short for file record (${buffer.byteLength} < ${{FILE_RECORD_SIZE}})`);
-    }
-    const record: FileRecord = {} as FileRecord;
-    record.header = {} as FileRecordHeader;
-    let offset = 0;
-    record.header.magic                = buffer.toString('ascii', 0, 4); offset += 4;
-    record.header.updateSequenceOffset = buffer.readUint16LE(offset);    offset += 2;
-    record.header.updateSequenceSize   = buffer.readUint16LE(offset);    offset += 2;
-    record.header.logSequence          = buffer.readBigUint64LE(offset); offset += 8;
-    record.header.sequenceNumber       = buffer.readUint16LE(offset);    offset += 2;
-    record.header.hardLinkCount        = buffer.readUint16LE(offset);    offset += 2;
-    record.header.firstAttributeOffset = buffer.readUint16LE(offset);    offset += 2;
-    record.header.flags                = buffer.readUint16LE(offset);    offset += 2;
-    record.header.usedSize             = buffer.readUInt32LE(offset);    offset += 4;
-    record.header.allocatedSize        = buffer.readUInt32LE(offset);    offset += 4;
-    record.header.fileReference        = buffer.readBigUInt64LE(offset); offset += 8;
-    record.header.nextAttributeId      = buffer.readUInt16LE(offset);    offset += 2;
-    record.header.unused               = buffer.readUInt16LE(offset);    offset += 2;
-    record.header.recordNumber         = buffer.readUint32LE(offset);    offset += 4;
-    record.attributes = [];
-    console.log(offset);
-    console.log(record.header.firstAttributeOffset);
-    parseFileRecordAttributes(record, buffer);
-    return record;
-}
-
-function parseFileRecordAttributes(fileRecord: FileRecord, buffer: Buffer): void {
-    let offset = fileRecord.header.firstAttributeOffset;
-    while (true) {
-        const attributeStartOffset = offset;
-        console.log(offset);
-        const attribute: Attribute = {} as Attribute;
-        const baseHeader: BaseAttributeHeader = {} as BaseAttributeHeader;
-        baseHeader.attributeType = buffer.readUInt32LE(offset);                 offset += 4;
-        baseHeader.length        = buffer.readUint32LE(offset);                 offset += 4;
-        baseHeader.nonResident   = buffer.readUint8(offset) > 0 ? true : false; offset += 1;
-        baseHeader.nameLength    = buffer.readUint8(offset);                    offset += 1;
-        baseHeader.nameOffset    = buffer.readUint16LE(offset);                 offset += 2;
-        baseHeader.flags         = buffer.readUint16LE(offset);                 offset += 2;
-        baseHeader.attributeId   = buffer.readUint16LE(offset);                 offset += 2;
-        if (baseHeader.nameLength > 0) {
-            baseHeader.name = buffer.toString('utf8', attributeStartOffset + baseHeader.nameOffset, attributeStartOffset + baseHeader.nameOffset + baseHeader.nameLength);
-        }
-        if (baseHeader.nonResident) {
-            attribute.header = baseHeader as NonResidentAttributeHeader;
-            attribute.header.firstCluster       = buffer.readBigInt64LE(offset);  offset += 8;
-            attribute.header.lastCluster        = buffer.readBigInt64LE(offset);  offset += 8;
-            attribute.header.dataRunsOffset     = buffer.readUInt16LE(offset);    offset += 2;
-            attribute.header.compressionUnit    = buffer.readUInt16LE(offset);    offset += 2;
-            attribute.header.unused             = buffer.readUInt32LE(offset);    offset += 4;
-            attribute.header.attributeAllocated = buffer.readBigUint64LE(offset); offset += 8;
-            attribute.header.attributeSize      = buffer.readBigUint64LE(offset); offset += 8;
-            attribute.header.streamDataSize     = buffer.readBigUint64LE(offset); offset += 8;
-            attribute.header.dataRuns = [];
-            parseAttributeDataRuns(attribute, buffer, attributeStartOffset);
-            attribute.contents = Buffer.alloc(0);
-        } else {
-            attribute.header = baseHeader as ResidentAttributeHeader;
-            attribute.header.valueLength = buffer.readUint32LE(offset);                 offset += 4;
-            attribute.header.valueOffset = buffer.readUint16LE(offset);                 offset += 2;
-            attribute.header.indexed     = buffer.readUint8(offset) > 0 ? true : false; offset += 1;
-            attribute.header.unused      = buffer.readUint8(offset);                    offset += 1;
-            offset = attributeStartOffset + attribute.header.valueOffset;
-            attribute.contents = buffer.subarray(offset, offset + attribute.header.length);
-        }
-        fileRecord.attributes.push(attribute);
-        if (attribute.header.attributeType === AttributeType.END) {
-            break;
-        }
-        offset = attributeStartOffset + attribute.header.length;
-    }
-}
-
-function parseAttributeDataRuns(attribute: Attribute, buffer: Buffer, attributeStartOffset: number): void {
-    if (!attribute.header.nonResident) {
-        throw new Error('Cannot parse attribute data runs for resident attribute');
-    }
-    let offset = attributeStartOffset + attribute.header.dataRunsOffset;
-    while (offset < attributeStartOffset + attribute.header.length) {
-        const dataRun: DataRun = {} as DataRun;
-        const fullByte = buffer.readUint8(offset);                                     offset += 1;
-        console.log('fullByte: ', fullByte);
-        dataRun.lengthFieldLength = fullByte & 0x0F;
-        dataRun.offsetFieldLength = (fullByte & 0xF0) >> 4;
-        dataRun.length = BigInt(buffer.readUintLE(offset, dataRun.lengthFieldLength)); offset += dataRun.lengthFieldLength;
-        dataRun.offset = BigInt(buffer.readUintLE(offset, dataRun.offsetFieldLength)); offset += dataRun.offsetFieldLength;
-        attribute.header.dataRuns.push(dataRun);
-        offset += 1 + dataRun.lengthFieldLength + dataRun.offsetFieldLength;
-    }
 }
 
 function readFileName(file: FileHandle, fileRecord: FileRecord): string {
