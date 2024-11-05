@@ -8,6 +8,7 @@ const FILE_RECORD_SIZE = 1024;
 const FILE_RECORD_HEADER_SIZE = 48;
 // const BASE_ATTRIBUTE_HEADER_MIN_LENGTH = 16;
 // const RESIDENT_ATTRIBUTE_HEADER_MIN_LENGTH = BASE_ATTRIBUTE_HEADER_MIN_LENGTH + 8;
+const DATA_RUN_MIN_LENGTH = 3;
 const DATA_RUN_MAX_LENGTH = 17;
 // const NON_RESIDENT_ATTRIBUTE_HEADER_MIN_LENGTH = BASE_ATTRIBUTE_HEADER_MIN_LENGTH + 48;
 
@@ -45,7 +46,7 @@ class BPB {
     
     public parse(buffer: Buffer): number {
         if (buffer.byteLength < BPB_LENGTH) {
-            throw new Error(`Buffer is too short for BPB (${buffer.byteLength} < ${{BPB_LENGTH}})`);
+            throw new Error(`Buffer is too short for BPB (${buffer.byteLength} < ${BPB_LENGTH})`);
         }
         let offset = 0;
         this.bytesPerSector    = buffer.readUint16LE(offset);  offset += 2;
@@ -76,7 +77,7 @@ class ExtendedBPB {
     
     public parse(buffer: Buffer): number {
         if (buffer.byteLength < EXTENDED_BPB_LENGTH) {
-            throw new Error(`Buffer is too short for extended BPB (${buffer.byteLength} < ${{EXTENDED_BPB_LENGTH}})`);
+            throw new Error(`Buffer is too short for extended BPB (${buffer.byteLength} < ${EXTENDED_BPB_LENGTH})`);
         }
         let offset = 0;
         this.unused1                       = buffer.readUInt32LE(offset);    offset += 4;
@@ -102,7 +103,7 @@ class PartitionBootSector {
     
     public parse(buffer: Buffer): number {
         if (buffer.byteLength < PARTITION_BOOT_SECTOR_LENGTH) {
-            throw new Error(`Buffer is too short for partition boot sector (${buffer.byteLength} < ${{PARTITION_BOOT_SECTOR_LENGTH}})`);
+            throw new Error(`Buffer is too short for partition boot sector (${buffer.byteLength} < ${PARTITION_BOOT_SECTOR_LENGTH})`);
         }
         let offset = 0;
         this.jumpInstruction   = buffer.readUintLE(offset, 3);                                      offset += 3;
@@ -133,10 +134,13 @@ class FileRecordHeader {
     
     public parse(buffer: Buffer): number {
         if (buffer.byteLength < FILE_RECORD_HEADER_SIZE) {
-            throw new Error(`Buffer is too short for file record header (${buffer.byteLength} < ${{FILE_RECORD_HEADER_SIZE}})`);
+            throw new Error(`Buffer is too short for file record header (${buffer.byteLength} < ${FILE_RECORD_HEADER_SIZE})`);
         }
         let offset = 0;
         this.magic                = buffer.toString('ascii', 0, 4); offset += 4;
+        if (this.magic !== 'FILE' && this.magic !== 'BAAD') {
+            throw new Error(`File record header magic string is not valid (tried to parse an invalid file record): "${this.magic}"`);
+        }
         this.updateSequenceOffset = buffer.readUint16LE(offset);    offset += 2;
         this.updateSequenceSize   = buffer.readUint16LE(offset);    offset += 2;
         this.logSequence          = buffer.readBigUint64LE(offset); offset += 8;
@@ -176,6 +180,9 @@ class BaseAttributeHeader {
         if (this.nameLength > 0) {
             this.name = buffer.toString('utf8', this.nameOffset, this.nameOffset + this.nameLength);
         }
+        if (!this.nonResident && this.length > 1024) {
+            throw new Error(`Resident attribute header length ${this.length} is greater than entire file record length of ${FILE_RECORD_SIZE}`);
+        }
         return offset;
     }
     
@@ -209,12 +216,11 @@ class DataRun {
     public offset = 0n;           // A variable-length field from 1 to 8 bytes
     
     public parse(buffer: Buffer): number {
-        if (buffer.byteLength < DATA_RUN_MAX_LENGTH) {
-            throw new Error(`Buffer is too short for data run (${buffer.byteLength} < ${{DATA_RUN_MAX_LENGTH}})`);
+        if (buffer.byteLength < DATA_RUN_MIN_LENGTH) {
+            throw new Error(`Buffer is too short for data run (${buffer.byteLength} < ${DATA_RUN_MIN_LENGTH})`);
         }
         let offset = 0;
         const fullByte = buffer.readUint8(offset);                                     offset += 1;
-        console.log('fullByte: ', fullByte);
         this.lengthFieldLength = fullByte & 0x0F;
         this.offsetFieldLength = (fullByte & 0xF0) >> 4;
         if (fullByte === 0) {
@@ -290,15 +296,12 @@ class FileRecord {
     
     public parse(buffer: Buffer): number {
         if (buffer.byteLength < FILE_RECORD_SIZE) {
-            throw new Error(`Buffer is too short for file record (${buffer.byteLength} < ${{FILE_RECORD_SIZE}})`);
+            throw new Error(`Buffer is too short for file record (${buffer.byteLength} < ${FILE_RECORD_SIZE})`);
         }
         let offset = 0;
         offset += this.header.parse(buffer.subarray(offset, offset + FILE_RECORD_HEADER_SIZE));
-        console.log(offset);
-        console.log(this.header.firstAttributeOffset);
         let attributeStartOffset = this.header.firstAttributeOffset;
         while (true) {
-            console.log(attributeStartOffset);
             const attribute = new Attribute();
             attribute.parse(buffer.subarray(attributeStartOffset));
             this.attributes.push(attribute);
@@ -311,10 +314,15 @@ class FileRecord {
     }
 }
 
+class FileRecordSequence {
+    public startByte = 0;
+    public recordCount = 0;
+}
+
 await main();
 
 async function main(): Promise<void> {
-    const file = await fs.open('N:/jesslap/backup-nvme0n1p1.img');
+    const file = await fs.open('N:/jesslap/backup-nvme0n1p3.img');
     
     const partitionBootSectorBuffer = Buffer.alloc(PARTITION_BOOT_SECTOR_LENGTH);
     await file.read(partitionBootSectorBuffer, 0, PARTITION_BOOT_SECTOR_LENGTH, 0);
@@ -322,25 +330,58 @@ async function main(): Promise<void> {
     bootSector.parse(partitionBootSectorBuffer);
     console.log(bootSector);
     
-    const mftFileRecordBuffer = Buffer.alloc(FILE_RECORD_SIZE);
-    const mftStartByte = bootSector.extendedBpb.mftLogicalClusterNumber * BigInt(bootSector.bpb.sectorsPerCluster) * BigInt(bootSector.bpb.bytesPerSector);
-    await file.read(mftFileRecordBuffer, 0, FILE_RECORD_SIZE, Number(mftStartByte));
-    const mftFileRecord = new FileRecord();
-    mftFileRecord.parse(mftFileRecordBuffer);
-    console.dir(mftFileRecord, {depth: null});
+    const filesStartByte = 593727488;
+    const ONE_GIGABYTE_IN_BYTES = 1073741824;
+    const sequences = await findFileRecordSequences(file, filesStartByte, filesStartByte + ONE_GIGABYTE_IN_BYTES / 8);
+    const filteredSequences = sequences.filter(s => s.recordCount > 3);
+    console.log('sequence count:', sequences.length);
+    console.log('filtered sequence count:', filteredSequences.length);
+    console.log(filteredSequences);
     
-    const dataAttribute = mftFileRecord.attributes.find(a => a.header.attributeType === AttributeType.DATA);
-    if (dataAttribute === undefined) {
-        throw new Error('No data attribute for MFT file');
+    const fileRecords: FileRecord[] = [];
+    for (const sequence of filteredSequences) {
+        const buffer = Buffer.alloc(sequence.recordCount * FILE_RECORD_SIZE);
+        await file.read(buffer, 0, buffer.length, sequence.startByte);
+        for (let r = 0; r < sequence.recordCount; r++) {
+            try {
+                const record = new FileRecord();
+                const subBuf = buffer.subarray(r * FILE_RECORD_SIZE, r * FILE_RECORD_SIZE + FILE_RECORD_SIZE);
+                console.log('subBuf.length:', subBuf.length);
+                record.parse(subBuf);
+                fileRecords.push(record);
+            } catch(e) {
+                console.log(`Skipping record at ${sequence.startByte + r * FILE_RECORD_SIZE} due to parse error:`, e);
+            }
+        }
     }
-    if (!dataAttribute.header.nonResident) {
-        throw new Error('Data attribute for MFT file is resident (this is unexpected)');
-    }
+    //console.log(fileRecords);
     
-    //const data = readFileData(file, mftFileRecord);
-    console.log('about to read filename');
-    const filename = readFileName(file, mftFileRecord);
-    console.log(filename);
+    const lastFile = fileRecords[fileRecords.length - 1];
+    console.dir(lastFile, {depth: undefined});
+    console.log(readFileName(file, lastFile));
+    
+    // const mftFileRecordBuffer = Buffer.alloc(FILE_RECORD_SIZE);
+    // const mftStartByte = bootSector.extendedBpb.mftLogicalClusterNumber * BigInt(bootSector.bpb.sectorsPerCluster) * BigInt(bootSector.bpb.bytesPerSector);
+    // const mftMirrStartByte = bootSector.extendedBpb.mftMirrorLogicalClusterNumber * BigInt(bootSector.bpb.sectorsPerCluster) * BigInt(bootSector.bpb.bytesPerSector);
+    // console.log('mftStartByte:', mftStartByte);
+    // console.log('mftMirrStartByte:', mftMirrStartByte);
+    // await file.read(mftFileRecordBuffer, 0, FILE_RECORD_SIZE, Number(mftStartByte /*+ 8192n*/));
+    // const mftFileRecord = new FileRecord();
+    // mftFileRecord.parse(mftFileRecordBuffer);
+    // console.dir(mftFileRecord, {depth: null});
+    // 
+    // const dataAttribute = mftFileRecord.attributes.find(a => a.header.attributeType === AttributeType.DATA);
+    // if (dataAttribute === undefined) {
+    //     throw new Error('No data attribute for MFT file');
+    // }
+    // if (!dataAttribute.header.nonResident) {
+    //     throw new Error('Data attribute for MFT file is resident (this is unexpected)');
+    // }
+    // 
+    // //const data = readFileData(file, mftFileRecord);
+    // console.log('about to read filename');
+    // const filename = readFileName(file, mftFileRecord);
+    // console.log(filename);
 }
 
 function readFileName(file: FileHandle, fileRecord: FileRecord): string {
@@ -363,3 +404,62 @@ function readFileName(file: FileHandle, fileRecord: FileRecord): string {
 //function readFileData(file: FileHandle, fileRecord: FileRecord): Buffer {
 //    if (fileRecord.header.)
 //}
+
+async function findFileRecordSequences(file: FileHandle, startByte: number, endByte: number|undefined): Promise<FileRecordSequence[]> {
+    const sequences: FileRecordSequence[] = [];
+    const buffer = Buffer.alloc(524288000);
+    console.log(`Reading file chunk from ${startByte} to ${startByte + buffer.length}`);
+    let readResult = await file.read(buffer, 0, buffer.length, startByte);
+    console.log('readResult.bytesRead:', readResult.bytesRead);
+    console.log('buffer.byteLength:', buffer.byteLength);
+    let sequence = new FileRecordSequence();
+    let bufferStartByte = startByte;
+    let byte = startByte;
+    while (true) {
+        
+        // Check if we need to read more file
+        if (byte + 4 - bufferStartByte >= buffer.byteLength) {
+            console.log(`Reading file chunk from ${byte} to ${byte + buffer.length}`);
+            readResult = await file.read(buffer, 0, buffer.length, byte);
+            console.log('readResult.bytesRead:', readResult.bytesRead);
+            console.log('buffer.byteLength:', buffer.byteLength);
+            if (readResult.bytesRead === 0) {
+                console.log('No more bytes in file, finishing');
+                if (sequence.recordCount !== 0) {
+                    sequences.push(sequence);
+                }
+                break;
+            }
+            bufferStartByte = byte;
+        }
+        
+        // Read the magic string
+        const magic = buffer.toString('ascii', byte - bufferStartByte, byte + 4 - bufferStartByte);
+        
+        if (magic === 'FILE' || magic === 'BAAD') {
+            
+            // The magic string was found and we didn't have an existing sequence, so begin a new one
+            if (sequence.recordCount === 0) {
+                sequence.startByte = byte;
+            }
+            
+            // Record another file in the sequence and advance by the length of a record
+            sequence.recordCount++;
+            byte += 1024;
+        } else {
+            
+            // The magic sequence wasn't found, so if we had a sequence going, record it
+            if (sequence.recordCount !== 0) {
+                sequences.push(sequence);
+                sequence = new FileRecordSequence();
+            }
+            
+            byte++;
+        }
+        
+        if (endByte !== undefined && byte > endByte) {
+            break;
+        }
+    }
+    return sequences;
+}
